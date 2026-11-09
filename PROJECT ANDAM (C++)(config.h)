@@ -1,0 +1,33 @@
+// Project ANDAM node - settings you edit before flashing
+#pragma once
+
+// ---- this device (must match the Device ID you add in the dashboard) ----
+#define NODE_ID            "ANDAM-01"
+
+// ---- Firebase: tech2forms Realtime Database ----
+#define FIREBASE_HOST      "tech2forms-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH      "ogTI730q7DY6kIUIxV9fLpmLlxiQI8Sr48rPJOOQ"
+
+// ---- SIM / network (Smart/TNT "internet", Globe/TM "http.globe.com.ph", DITO "internet.dito.ph") ----
+#define GSM_APN            "internet"
+#define GSM_PIN            ""
+
+// ---- measuring ----
+// Maximum height / distance from the VL53L0X face down to the DRY road surface (30 inches = 762.0 mm).
+#define MAX_HEIGHT_IN      30.0f
+#define SENSOR_HEIGHT_MM   762.0f
+// Wake interval if the dashboard has not set one (seconds)
+#define DEFAULT_SLEEP_S    10
+
+// 1 = also upload readings flagged UNSTABLE (bench testing). Set 0 for the field.
+#define UPLOAD_UNSTABLE    1
+
+// Longest distance the sensor may report (762 mm + 25 mm tolerance for dry ground noise; >= 788 mm is rejected)
+#define MAX_RANGE_MM       788
+
+// ---- camera (ESP32-CAM, optional) ----
+// 1 = ESP32-CAM wired (IO34/IO14 + MOSFET on IO13). 0 = no camera, photo requests are ignored.
+#define CAMERA_ENABLED     0
+// Photo every N wake-ups (0 = only when the dashboard asks or the level rises). 10 x 60 s = about every 10 min.
+#define PHOTO_EVERY        10
+#define MAX_PHOTO_BYTES    60000
