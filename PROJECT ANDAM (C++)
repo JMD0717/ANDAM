@@ -1,0 +1,558 @@
+// Project ANDAM - solar water-level node
+// Board : LilyGO T-A7670G R2 (ESP32 + SIMCom A7670G LTE modem)
+// Sensor: VL53L0X laser ToF, faces down at the float in the pipe
+// Cloud : tech2forms Realtime Database  sensors/{NODE_ID}/reading  (same shape the dashboard reads)
+//
+// Wiring (see diagram): VL53L0X VIN->3V3, GND->GND, SDA->IO32, SCL->IO18
+//                       battery sense IO35 (on board)
+//                       ESP32-CAM (optional): CAM U0T -> IO34, IO14 -> 1 kOhm -> CAM U0R,
+//                       MOSFET gate IO13 switches the camera's GND (HIGH = camera on), 5 V from the boost module
+// Libraries: TinyGSM, ArduinoJson, VL53L0X (Pololu)
+// Build with PSRAM enabled (FQBN esp32:esp32:esp32:PSRAM=enabled) - the photo buffers live there.
+
+#define TINY_GSM_MODEM_SIM7600     // the A7670 speaks the SIM7600 AT dialect
+#define TINY_GSM_RX_BUFFER 1024
+#include <Arduino.h>
+#include <Wire.h>
+#include <TinyGsmClient.h>
+#include <ArduinoJson.h>
+#include <VL53L0X.h>
+#include "mbedtls/base64.h"
+#include "config.h"
+
+// ---- LilyGO T-A7670G pins ----
+#define MODEM_TX 26
+#define MODEM_RX 27
+#define MODEM_PWRKEY 4
+#define MODEM_RESET 5
+#define BOARD_POWERON 12
+#define BAT_ADC 35
+#define CAM_MOSFET 13
+#define CAM_RX 34       // from CAM U0T
+#define CAM_TX 14       // to CAM U0R (through 1 kOhm)
+#define SDA_PIN 32
+#define SCL_PIN 18
+
+HardwareSerial SerialAT(1);
+HardwareSerial CamSerial(2);
+TinyGsm modem(SerialAT);
+VL53L0X tof;
+
+RTC_DATA_ATTR int lastClass = 0;   // 0 low, 1 moderate, 2 severe (SMS only when it gets worse)
+RTC_DATA_ATTR int photoCycle = 0;  // wake-ups since the last photo
+
+// ---------------------------------------------------------------- sensor
+// Returns false when too few samples hit the float. 'why' says what went wrong.
+bool measure(float &mm, bool &stable, String &why) {
+  const int N = 15; uint16_t v[N]; int n = 0, noTarget = 0, timeouts = 0;
+  String raw;
+  for (int i = 0; i < N; i++) {
+    uint16_t d = tof.readRangeSingleMillimeters();
+    raw += String(d) + ' ';
+    if (tof.timeoutOccurred()) timeouts++;
+    else if (d >= MAX_RANGE_MM || d <= 10) noTarget++;   // 8190/8191 = nothing seen
+    else v[n++] = d;
+  }
+  Serial.println("raw mm: " + raw);
+  if (n < N / 2) {
+    why = timeouts >= N / 2 ? "sensor not answering (I2C)" : "no target in range";
+    return false;
+  }
+  for (int i = 1; i < n; i++) { uint16_t k = v[i]; int j = i - 1; while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; } v[j + 1] = k; }
+  // Reject the lowest 40% of readings (which are caused by early side-wall reflections)
+  // and average the upper-middle 40% (the true center-beam distance to the float).
+  int lo = (n * 2) / 5;
+  int hi = n - (n / 5);
+  if (hi <= lo) { lo = 0; hi = n; }
+  float s = 0;
+  for (int i = lo; i < hi; i++) s += v[i];
+  mm = s / (hi - lo);
+  stable = (v[hi - 1] - v[lo]) <= 15;
+  return true;
+}
+// same thresholds as the dashboard (inches): <=10 low, 10-19 moderate, >19 severe
+int classOf(float in) { return in <= 10 ? 0 : in <= 19 ? 1 : 2; }
+const char *textOf(int c) { return c == 0 ? "Normal" : c == 1 ? "Moderate flooding" : "Severe flooding"; }
+int batteryPct() {
+  uint32_t mv = 0; for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(BAT_ADC);
+  float v = mv / 8.0f * 2 / 1000.0f;                       // 1:2 divider
+  int p = (int)((v - 3.3f) / (4.2f - 3.3f) * 100); return p < 0 ? 0 : p > 100 ? 100 : p;
+}
+
+// ---------------------------------------------------------------- modem
+bool modemUp() {
+  pinMode(BOARD_POWERON, OUTPUT); digitalWrite(BOARD_POWERON, HIGH); delay(500);
+  pinMode(MODEM_RESET, OUTPUT); digitalWrite(MODEM_RESET, HIGH);
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  if (!modem.testAT(800) && !modem.testAT(800)) {        // PWRKEY toggles, so only pulse when it is off
+    pinMode(MODEM_PWRKEY, OUTPUT); digitalWrite(MODEM_PWRKEY, LOW); delay(100);
+    digitalWrite(MODEM_PWRKEY, HIGH); delay(1500); digitalWrite(MODEM_PWRKEY, LOW);   // bench-tested: 1.5 s HIGH starts this board
+    delay(5000);
+  }
+  Serial.print("Starting modem");
+  uint32_t t0 = millis();
+  while (!modem.testAT(1000)) { Serial.print('.'); if (millis() - t0 > 30000) { Serial.println("\nModem not answering"); return false; } }
+  Serial.println("\nModem: " + modem.getModemInfo());
+  if (strlen(GSM_PIN) && modem.getSimStatus() != 3) modem.simUnlock(GSM_PIN);
+  int sim = modem.getSimStatus(); Serial.printf("SIM status: %d (1 = ready)\n", sim);
+  if (sim != 1) { Serial.println("  -> No SIM / SIM locked. Insert an active nano-SIM."); return false; }
+  modem.sendAT("+CNMP=2"); modem.waitResponse(2000);      // Auto LTE + GSM mode
+  modem.sendAT("+CEMODE=2"); modem.waitResponse(2000);    // Combined EPS/IMSI attach (enables both LTE data and SMS)
+  Serial.print("Waiting for network");
+  if (!modem.waitForNetwork(60000)) { Serial.println(" - no signal"); return false; }
+  Serial.printf(" - ok, signal %d/31, operator %s\n", (int)modem.getSignalQuality(), modem.getOperator().c_str());
+  bool data = false;
+  for (int i = 0; i < 4 && !data; i++) { if (i) delay(3000); data = modem.gprsConnect(GSM_APN); }
+  if (!data) { Serial.println("Mobile data failed (check GSM_APN / load)"); return false; }
+  Serial.println("Mobile data up, IP " + modem.localIP().toString());
+
+  // Initialize A7670G SMS subsystem (wait until SIM SMS storage is ready)
+  modem.sendAT("+CGSMS=2"); modem.waitResponse(2000);     // CS preferred, PS fallback for MO SMS
+  modem.sendAT("+CPMS=\"SM\",\"SM\",\"SM\""); modem.waitResponse(3000);
+  for (int i = 0; i < 5; i++) {
+    modem.sendAT("+CMGF=1");
+    if (modem.waitResponse(2000) == 1) break;
+    delay(1000);
+  }
+  modem.sendAT("+CSCS=\"GSM\""); modem.waitResponse(2000);
+  modem.sendAT("+CSMP=17,167,0,0"); modem.waitResponse(2000);
+  return true;
+}
+void modemDown() { modem.poweroff(); digitalWrite(BOARD_POWERON, LOW); }
+
+// ---------------------------------------------------------------- Firebase REST (modem's own HTTPS stack, AT+HTTP*)
+// TinyGSM has no SSL for this modem, so the A7670 does the TLS itself.
+// PUT is sent as POST + x-http-method-override=PUT (Firebase REST feature).
+int fb(bool put, const String &path, const String &body, String &resp) {
+  resp = "";
+  String url = String("https://") + FIREBASE_HOST + "/" + path + ".json?";
+  if (strlen(FIREBASE_AUTH)) url += String("auth=") + FIREBASE_AUTH + "&";
+  if (put) url += "x-http-method-override=PUT";
+  modem.sendAT("+HTTPTERM"); modem.waitResponse(2000);
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000) != 1) return -1;
+  modem.sendAT("+HTTPPARA=\"CID\",1"); modem.waitResponse(2000);
+  modem.sendAT("+HTTPPARA=\"URL\",\"" + url + "\"");
+  if (modem.waitResponse(5000) != 1) { modem.sendAT("+HTTPTERM"); modem.waitResponse(); return -2; }
+  if (put) {
+    modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\""); modem.waitResponse(2000);
+    modem.sendAT("+HTTPDATA=" + String(body.length()) + ",10000");
+    if (modem.waitResponse(5000, "DOWNLOAD") != 1) { modem.sendAT("+HTTPTERM"); modem.waitResponse(); return -3; }
+    SerialAT.print(body);
+    if (modem.waitResponse(30000) != 1) { modem.sendAT("+HTTPTERM"); modem.waitResponse(); return -4; }
+  }
+  modem.sendAT(String("+HTTPACTION=") + (put ? 1 : 0));
+  if (modem.waitResponse(5000) != 1) { modem.sendAT("+HTTPTERM"); modem.waitResponse(); return -5; }
+  String line; uint32_t t0 = millis(); int code = -6, len = 0;
+  while (millis() - t0 < 45000) {                       // +HTTPACTION: <method>,<status>,<len>
+    if (!SerialAT.available()) { delay(10); continue; }
+    line = SerialAT.readStringUntil(10); line.trim();
+    if (line.startsWith("+HTTPACTION:")) {
+      int c1 = line.indexOf(','), c2 = line.indexOf(',', c1 + 1);
+      code = line.substring(c1 + 1, c2).toInt(); len = line.substring(c2 + 1).toInt(); break;
+    }
+  }
+  if (code > 0 && len > 0) {
+    modem.sendAT("+HTTPREAD=0," + String(len < 4096 ? len : 4096));
+    // A7670 answers:  +HTTPREAD: <n>  <data...>  +HTTPREAD: 0     (SIM7600 writes "+HTTPREAD: DATA,<n>")
+    t0 = millis(); bool inData = false;
+    while (millis() - t0 < 10000) {
+      if (!SerialAT.available()) { delay(5); continue; }
+      line = SerialAT.readStringUntil(10); line.trim();
+      int tag = line.indexOf("+HTTPREAD:");
+      if (!inData) {
+        int c = line.indexOf(',');
+        if (tag == 0 && (c > 0 ? line.substring(c + 1) : line.substring(10)).toInt() > 0) inData = true;
+        continue;
+      }
+      if (tag >= 0) { resp += line.substring(0, tag); break; }   // "+HTTPREAD: 0" = end
+      resp += line;
+    }
+  }
+  modem.sendAT("+HTTPTERM"); modem.waitResponse(3000);
+  return code;
+}
+
+// ---------------------------------------------------------------- Bulletproof SMS (SIMCom A7670G)
+bool normalizePhone(const String &raw, String &intlFmt, String &localFmt) {
+  String clean = "";
+  for (size_t i = 0; i < raw.length(); i++) {
+    char c = raw[i];
+    if (c >= '0' && c <= '9') clean += c;
+    else if (c == '+' && clean.length() == 0) clean += c;
+  }
+  if (clean.startsWith("+639") && clean.length() == 13) {
+    intlFmt = clean;
+    localFmt = "0" + clean.substring(3);
+    return true;
+  }
+  if (clean.startsWith("639") && clean.length() == 12) {
+    intlFmt = "+" + clean;
+    localFmt = "0" + clean.substring(2);
+    return true;
+  }
+  if (clean.startsWith("09") && clean.length() == 11) {
+    intlFmt = "+63" + clean.substring(1);
+    localFmt = clean;
+    return true;
+  }
+  if (clean.startsWith("9") && clean.length() == 10) {
+    intlFmt = "+63" + clean;
+    localFmt = "0" + clean;
+    return true;
+  }
+  if (clean.length() >= 10 && clean.length() <= 15 && (clean.startsWith("+") || clean.startsWith("0"))) {
+    intlFmt = clean;
+    localFmt = clean;
+    return true;
+  }
+  return false;
+}
+
+bool sendRawAT_SMS(const String &num, const String &msg) {
+  while (SerialAT.available()) SerialAT.read();
+  modem.sendAT(""); modem.waitResponse(1000);
+  modem.sendAT("+CMGF=1");
+  if (modem.waitResponse(3000) != 1) {
+    modem.sendAT("+CPMS=\"SM\",\"SM\",\"SM\""); modem.waitResponse(3000);
+    modem.sendAT("+CMGF=1"); modem.waitResponse(3000);
+  }
+  modem.sendAT("+CSCS=\"GSM\""); modem.waitResponse(2000);
+  modem.sendAT("+CSMP=17,167,0,0"); modem.waitResponse(2000);
+
+  while (SerialAT.available()) SerialAT.read();
+  SerialAT.print("AT+CMGS=\"");
+  SerialAT.print(num);
+  SerialAT.print("\"\r");
+  SerialAT.flush();
+
+  uint32_t t0 = millis();
+  bool gotPrompt = false;
+  String respBuf = "";
+  while (millis() - t0 < 10000) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      respBuf += c;
+      if (c == '>') { gotPrompt = true; break; }
+    }
+    if (gotPrompt) break;
+    if (respBuf.indexOf("ERROR") >= 0) break;
+    delay(10);
+  }
+  if (!gotPrompt) {
+    Serial.println("  -> No '>' prompt for " + num + " (" + respBuf + ")");
+    SerialAT.write(0x1B); // ESC to guarantee modem exits SMS input mode
+    SerialAT.print("\r\n");
+    modem.waitResponse(2000);
+    return false;
+  }
+
+  delay(50);
+  SerialAT.print(msg);
+  SerialAT.flush();
+  delay(100);
+  SerialAT.write(0x1A); // Ctrl+Z
+  SerialAT.flush();
+
+  t0 = millis();
+  respBuf = "";
+  bool cmgsSeen = false;
+  while (millis() - t0 < 45000) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      respBuf += c;
+    }
+    if (respBuf.indexOf("+CMGS:") >= 0) cmgsSeen = true;
+    if (cmgsSeen && respBuf.indexOf("OK") >= 0) return true;
+    if (respBuf.indexOf("+CMS ERROR") >= 0 || respBuf.indexOf("\nERROR") >= 0 || respBuf.indexOf("\rERROR") >= 0) {
+      Serial.println("  -> Modem rejected SMS: " + respBuf);
+      return false;
+    }
+    delay(20);
+  }
+  Serial.println("  -> SMS timeout (" + respBuf + ")");
+  SerialAT.write(0x1B);
+  SerialAT.print("\r\n");
+  modem.waitResponse(2000);
+  return false;
+}
+
+bool sendSMSBulletproof(const String &rawNum, const String &msg) {
+  String intlFmt, localFmt;
+  if (!normalizePhone(rawNum, intlFmt, localFmt)) {
+    Serial.println("Skipping invalid phone number: " + rawNum);
+    return false;
+  }
+  // Attempt 1: CS preferred (+CGSMS=2) with international format (+639...)
+  modem.sendAT("+CGSMS=2"); modem.waitResponse(2000);
+  if (sendRawAT_SMS(intlFmt, msg)) return true;
+  delay(1000);
+
+  // Attempt 2: CS preferred (+CGSMS=2) with local format (09...)
+  if (localFmt != intlFmt && sendRawAT_SMS(localFmt, msg)) return true;
+  delay(1000);
+
+  // Attempt 3: PS/LTE preferred (+CGSMS=3) fallback
+  modem.sendAT("+CGSMS=3"); modem.waitResponse(2000);
+  bool ok = sendRawAT_SMS(intlFmt, msg);
+  if (!ok && localFmt != intlFmt) {
+    delay(1000);
+    ok = sendRawAT_SMS(localFmt, msg);
+  }
+  modem.sendAT("+CGSMS=2"); modem.waitResponse(2000);
+  return ok;
+}
+
+void addUniquePhone(const String &raw, String out[], int &n, int maxN) {
+  String intl, local;
+  if (!normalizePhone(raw, intl, local)) return;
+  for (int i = 0; i < n; i++) {
+    String existIntl, existLocal;
+    if (normalizePhone(out[i], existIntl, existLocal) && existIntl == intl) return;
+  }
+  if (n < maxN) out[n++] = raw;
+}
+
+void collectPhoneNumbers(JsonVariant v, String out[], int &n, int maxN) {
+  if (v.isNull() || n >= maxN) return;
+  if (v.is<const char*>()) {
+    addUniquePhone(String(v.as<const char*>()), out, n, maxN);
+    return;
+  }
+  if (v.is<int64_t>() || v.is<uint64_t>()) {
+    addUniquePhone(v.as<String>(), out, n, maxN);
+    return;
+  }
+  if (v.is<JsonArray>()) {
+    for (JsonVariant item : v.as<JsonArray>()) collectPhoneNumbers(item, out, n, maxN);
+    return;
+  }
+  if (v.is<JsonObject>()) {
+    JsonObject obj = v.as<JsonObject>();
+    const char *keys[] = {"number", "phone", "mobile", "contact", "phoneNumber", "contactNumber", "tel", "sms"};
+    bool foundField = false;
+    for (const char *k : keys) {
+      if (!obj[k].isNull()) {
+        if (!obj["enabled"].isNull() && obj["enabled"].is<bool>() && !obj["enabled"].as<bool>()) return;
+        if (!obj["active"].isNull() && obj["active"].is<bool>() && !obj["active"].as<bool>()) return;
+        collectPhoneNumbers(obj[k], out, n, maxN);
+        foundField = true;
+      }
+    }
+    if (foundField) return;
+    for (JsonPair kv : obj) collectPhoneNumbers(kv.value(), out, n, maxN);
+  }
+}
+
+bool fetchAndSendSMS(int cls, float depthIn) {
+  const int MAX_CONTACTS = 25;
+  String phones[MAX_CONTACTS];
+  int count = 0;
+  String resp;
+
+  const String paths[] = {
+    String("sensors/") + NODE_ID + "/contacts",
+    String("contacts")
+  };
+
+  for (const String &p : paths) {
+    int cCode = fb(false, p, "", resp);
+    Serial.printf("Contacts GET [%s] -> HTTP %d (%s)\n", p.c_str(), cCode, resp.substring(0, 120).c_str());
+    if (cCode == 200 && resp.length() > 0 && resp != "null" && resp != "{}" && resp != "[]") {
+      JsonDocument c;
+      DeserializationError err = deserializeJson(c, resp);
+      if (!err) {
+        collectPhoneNumbers(c.as<JsonVariant>(), phones, count, MAX_CONTACTS);
+      } else {
+        Serial.printf("Contacts JSON parse error: %s\n", err.c_str());
+      }
+    }
+    if (count > 0) break;
+  }
+
+  if (count == 0) {
+    Serial.println("  -> No valid contact numbers found in Firebase! Will retry next cycle.");
+    return false;
+  }
+
+  String msg = String("ANDAM ") + NODE_ID + ": " + textOf(cls) + ", water " + String(depthIn, 1) + " in.";
+  int sentCount = 0;
+  for (int i = 0; i < count; i++) {
+    if (i > 0) delay(1500); // Inter-SMS delay so carrier does not drop rapid multi-recipient texts
+    bool sent = sendSMSBulletproof(phones[i], msg);
+    Serial.printf("SMS %s: %s\n", phones[i].c_str(), sent ? "sent" : "failed");
+    if (sent) sentCount++;
+  }
+  return sentCount > 0;
+}
+
+// ---------------------------------------------------------------- camera (ESP32-CAM over UART, see andam_cam_esp32cam)
+// Powers the camera, asks for a photo, returns the JPEG (caller frees) or nullptr with 'err' set.
+uint8_t *takePhoto(size_t &len, String &err) {
+  len = 0; err = "camera did not answer (check the 5 V boost, MOSFET, IO34/IO14 wires, MB board removed)";
+  CamSerial.setRxBufferSize(8192);
+  CamSerial.begin(115200, SERIAL_8N1, CAM_RX, CAM_TX);
+  digitalWrite(CAM_MOSFET, HIGH);
+  uint8_t *buf = nullptr;
+  String line;
+  bool finished = false;
+  uint32_t t0 = millis(), lastSnap = 0;
+  while (!finished && millis() - t0 < 15000) {
+    if (millis() - lastSnap > 1500) { CamSerial.print("SNAP\n"); lastSnap = millis(); }
+    while (!finished && CamSerial.available()) {
+      char ch = CamSerial.read();
+      if (ch != '\n') { if (line.length() < 80) line += ch; else line = ""; continue; }   // boot text / noise
+      line.trim();
+      if (line.startsWith("ERR")) { err = "camera: " + line.substring(4); if (line.indexOf("init") >= 0) finished = true; }
+      else if (line.startsWith("IMG ")) {
+        finished = true;
+        long n = line.substring(4).toInt();
+        if (n <= 0 || n > MAX_PHOTO_BYTES) { err = "bad photo size " + String(n); break; }
+        buf = (uint8_t *)ps_malloc(n);
+        if (!buf) buf = (uint8_t *)malloc(n);
+        if (!buf) { err = "out of memory"; break; }
+        long got = 0; uint32_t t1 = millis();
+        while (got < n && millis() - t1 < 15000) {
+          int a = CamSerial.available();
+          if (a) got += CamSerial.readBytes(buf + got, a < n - got ? a : n - got); else delay(1);
+        }
+        if (got < n || buf[0] != 0xFF || buf[1] != 0xD8) {
+          err = got < n ? "photo cut off (" + String(got) + "/" + String(n) + " bytes)" : "not a JPEG";
+          free(buf); buf = nullptr; break;
+        }
+        len = n; err = "";
+      }
+      line = "";
+    }
+    delay(2);
+  }
+  digitalWrite(CAM_MOSFET, LOW);
+  CamSerial.end();
+  return buf;
+}
+
+// Photo when the dashboard asked for one (photoRequest = true), every PHOTO_EVERY wake-ups, or when flooding gets worse.
+// Stored as base64 JPEG in sensors/{id}/photo {data, bytes, at}; the result goes to sensors/{id}/cameraStatus.
+void photoStep(bool worse) {
+  String base = String("sensors/") + NODE_ID, resp;
+  photoCycle++;
+  bool asked = fb(false, base + "/photoRequest", "", resp) == 200 && resp == "true";
+  bool due = PHOTO_EVERY > 0 && photoCycle >= PHOTO_EVERY;
+  if (!asked && !due && !worse) return;
+  photoCycle = 0;
+  Serial.printf("Taking photo (%s)\n", asked ? "requested" : worse ? "level rose" : "scheduled");
+  size_t len; String err;
+  uint8_t *jpg = takePhoto(len, err);
+  if (asked) fb(true, base + "/photoRequest", "false", resp);
+  if (!jpg) {
+    Serial.println("Photo failed: " + err);
+    fb(true, base + "/cameraStatus", "\"" + err + "\"", resp);
+    return;
+  }
+  size_t b64Len = 0;
+  mbedtls_base64_encode(nullptr, 0, &b64Len, jpg, len);
+  char *b64 = (char *)ps_malloc(b64Len + 1);
+  if (!b64) b64 = (char *)malloc(b64Len + 1);
+  if (!b64) { free(jpg); fb(true, base + "/cameraStatus", "\"out of memory\"", resp); return; }
+  mbedtls_base64_encode((unsigned char *)b64, b64Len + 1, &b64Len, jpg, len);
+  b64[b64Len] = 0;
+  free(jpg);
+  String body;
+  if (!body.reserve(b64Len + 80)) { free(b64); fb(true, base + "/cameraStatus", "\"out of memory\"", resp); return; }
+  body = "{\"data\":\""; body += b64; body += "\",\"bytes\":" + String(len) + ",\"at\":{\".sv\":\"timestamp\"}}";
+  free(b64);
+  int code = fb(true, base + "/photo", body, resp);
+  Serial.printf("Photo %u bytes -> HTTP %d\n", (unsigned)len, code);
+  fb(true, base + "/cameraStatus", code == 200 ? String("\"ok\"") : "\"upload failed (HTTP " + String(code) + ")\"", resp);
+}
+
+void setup() {
+  Serial.begin(115200); delay(500);
+  Serial.println("\n=== ANDAM node " NODE_ID " ===");
+  Serial.printf("PSRAM: %s\n", psramFound() ? "yes" : "NO (photos limited by RAM)");
+  pinMode(CAM_MOSFET, OUTPUT); digitalWrite(CAM_MOSFET, LOW);
+  analogReadResolution(12);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  tof.setTimeout(500);
+  if (!tof.init()) Serial.println("VL53L0X NOT FOUND - check SDA->IO32, SCL->IO18, VIN->3V3, GND");
+  else {
+    // Narrow-beam / High-Accuracy mode for up to 35 in (889 mm) inside a pipe:
+    // 0.35 MCPS rejects weak side-lobe reflections off pipe walls (3.5x stricter than 0.10)
+    // while reliably detecting the float all the way down to 35 inches (889 mm).
+    tof.setSignalRateLimit(0.35);
+    tof.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 14);
+    tof.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 10);
+    tof.setMeasurementTimingBudget(200000);
+    Serial.println("VL53L0X ready (high-accuracy narrow center-beam mode)");
+  }
+}
+
+void loop() {
+  uint32_t sleepS = DEFAULT_SLEEP_S;
+  float mm = 0, depthIn = 0; bool stable = false; int cls = 0;
+  String why;
+  bool ok = measure(mm, stable, why);
+  if (ok) {
+    float depthMm = SENSOR_HEIGHT_MM - mm;
+    if (depthMm < 0.0f) depthMm = 0.0f;
+    if (depthMm > SENSOR_HEIGHT_MM) depthMm = SENSOR_HEIGHT_MM;
+    depthIn = depthMm / 25.4f;
+    if (depthIn < 0.0f) depthIn = 0.0f;
+    if (depthIn > MAX_HEIGHT_IN) depthIn = MAX_HEIGHT_IN;
+    cls = classOf(depthIn);
+    Serial.printf("Distance %.0f mm  depth %.1f in  %s  [%s]  battery %d%%\n", mm, depthIn, textOf(cls), stable ? "stable" : "UNSTABLE", batteryPct());
+  } else Serial.println("No valid reading (" + why + ") - water level not updated");
+
+  static bool isModemActive = false;
+  if (!ok || stable || UPLOAD_UNSTABLE) {
+    // Only boot the modem if it's currently off or lost its GPRS connection
+    if (!isModemActive || !modem.isGprsConnected()) {
+      isModemActive = modemUp();
+    }
+    bool up = isModemActive;
+    bool worse = ok && cls > lastClass;
+    if (up && !ok) {
+      // keep the last real water level; tell the dashboard why there is no new one
+      String body = String("{\"sensorError\":\"") + why + "\",\"errorAt\":{\".sv\":\"timestamp\"}}", resp;
+      Serial.printf("Status upload -> HTTP %d\n", fb(true, String("sensors/") + NODE_ID + "/health", body, resp));
+      // If distance >= MAX_RANGE_MM ("no target in range"), water is dry / target removed: reset alert level to 0
+      if (why == "no target in range" && lastClass != 0) {
+        Serial.println("Target beyond MAX_RANGE_MM (dry/cleared) -> resetting alert state to Normal (0)");
+        lastClass = 0;
+      }
+    } else if (up) {
+      JsonDocument d;
+      d["waterLevel"] = serialized(String(depthIn, 1));
+      d["status"] = cls; d["statusText"] = textOf(cls);
+      d["battery"] = batteryPct(); d["distanceMm"] = (int)mm;
+      d["timestamp"][".sv"] = "timestamp";
+      String body, resp; serializeJson(d, body);
+      int code = fb(true, String("sensors/") + NODE_ID + "/reading", body, resp);
+      Serial.printf("Upload -> HTTP %d %s\n", code, resp.substring(0, 120).c_str());
+      if (code == 401 || code == 403) Serial.println("  -> Firebase refused the write: set FIREBASE_AUTH in config.h (database secret).");
+      if (code == 200) {
+        fb(true, String("sensors/") + NODE_ID + "/health", "{\"sensorError\":\"\",\"errorAt\":0}", resp);
+        sleepS = 10; // Enforce exactly 10 seconds gap for real-time website monitoring
+        if (cls > lastClass) {
+          Serial.printf("Flood alert level rose (%d -> %d): sending SMS alerts...\n", lastClass, cls);
+          if (fetchAndSendSMS(cls, depthIn)) {
+            lastClass = cls; // Only lock in the new alert level after at least 1 SMS is confirmed sent
+          }
+        } else if (cls < lastClass) {
+          lastClass = cls;   // Water receded; lower threshold so a future rise triggers SMS again
+        }
+      }
+    }
+    if (up && CAMERA_ENABLED) photoStep(worse);
+    
+    // ONLY power down the modem if we are going into deep sleep (>= 20s).
+    // Keeping it ON allows for instant real-time data pushes every 10 seconds!
+    if (sleepS >= 20) {
+      modemDown();
+      isModemActive = false;
+    }
+  }
+  Serial.printf("Sleeping %u s\n", (unsigned)sleepS); Serial.flush();
+  if (sleepS < 20) delay(sleepS * 1000UL);
+  else { esp_sleep_enable_timer_wakeup(sleepS * 1000000ULL); esp_deep_sleep_start(); }
+}
